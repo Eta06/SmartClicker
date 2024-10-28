@@ -1,68 +1,55 @@
-import time
 import cv2
 import numpy as np
 import pyautogui
-from mss import mss
-import threading
+import mss
+import time
+from tkinter import messagebox, Tk
+from PyQt5.QtWidgets import QApplication, QMainWindow
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtWidgets import QLabel
 
-# Ask the user if they want to use OpenCL
-use_gpu = input("Use GPU acceleration with OpenCL (y/n)? ").lower() == 'y'
+class AspectRatioWidget(QMainWindow):
+    def __init__(self, width, height, aspect_ratio):
+        super().__init__()
+        self.aspect_ratio = aspect_ratio
+        self.setWindowTitle('Screen Capture')
+        
+        self.label = QLabel(self)
+        self.setCentralWidget(self.label)
+        
+        self.resize(width, height)
+        self.setMinimumSize(width//2, height//2)
+        
+    def resizeEvent(self, event):
+        new_size = event.size()
+        desired_height = int(new_size.width() / self.aspect_ratio)
+        
+        if desired_height > new_size.height():
+            desired_width = int(new_size.height() * self.aspect_ratio)
+            self.resize(desired_width, new_size.height())
+        else:
+            self.resize(new_size.width(), desired_height)
+        
+        super().resizeEvent(event)
 
-if use_gpu:
-    try:
-        import pyopencl as cl
-        import pyopencl.array
-
-        platforms = cl.get_platforms()
-        if len(platforms) == 0:
-            raise cl.RuntimeError("No OpenCL platforms found")
-
-        platform = platforms[0]  # Choose the first platform
-        devices = platform.get_devices(device_type=cl.device_type.ALL)
-        if len(devices) == 0:
-            raise cl.RuntimeError("No OpenCL devices found")
-
-        device = devices[0]  # Choose the first device
-        context = cl.Context([device])
-        queue = cl.CommandQueue(context)
-
-        print(f"Using OpenCL device: {device.name}")
-    except Exception as e:
-        print(f"OpenCL initialization failed: {str(e)}")
-        print("Falling back to CPU")
-        use_gpu = False
-
-# Load the cursor image
-original_cursor_img = cv2.imread('cursor.png', cv2.IMREAD_UNCHANGED)
-cursor_height = 16  # Smaller cursor size
-aspect_ratio = original_cursor_img.shape[1] / original_cursor_img.shape[0]
-cursor_width = int(cursor_height * aspect_ratio)
-cursor_img = cv2.resize(original_cursor_img, (cursor_width, cursor_height), interpolation=cv2.INTER_AREA)
-
-# Pre-compute alpha blending for cursor
-cursor_alpha = cursor_img[:, :, 3] / 255.0
-cursor_alpha = cursor_alpha[:, :, np.newaxis]
-cursor_rgb = cursor_img[:, :, :3]
+root = Tk()
+root.withdraw()
+use_gpu = messagebox.askyesno("GPU Acceleration", "Do you want to use GPU acceleration?")
+root.destroy()
 
 if use_gpu:
-    cursor_alpha_gpu = cl.array.to_device(queue, cursor_alpha.astype(np.float32))
-    cursor_rgb_gpu = cl.array.to_device(queue, cursor_rgb.astype(np.float32))
+    cv2.ocl.setUseOpenCL(True)
+    print("GPU acceleration enabled")
+else:
+    cv2.ocl.setUseOpenCL(False)
+    print("GPU acceleration disabled")
 
-    # OpenCL kernel for alpha blending
-    blend_kernel = cl.Program(context, """
-    __kernel void alpha_blend(__global const float4 *bg, __global const float *alpha, 
-                                    __global const float4 *fg, __global float4 *out) {
-        int gid = get_global_id(0);
-        float a = alpha[gid];
-        out[gid] = (1-a)*bg[gid] + a*fg[gid];
-    }
-    """).build()
-
-# Get screen resolution
 screen_width, screen_height = pyautogui.size()
 scale_factor = 2
+aspect_ratio = screen_width / screen_height
 window_width = screen_width // scale_factor
-window_height = screen_height // scale_factor
+window_height = int(window_width / aspect_ratio)
 
 print("============================")
 print(f"Monitor Width: {screen_width}")
@@ -71,93 +58,91 @@ print(f"App Windows Width: {window_width}")
 print(f"App Windows Height: {window_height}")
 print("============================")
 
-# Global variables for threading
-frame = None
-mouse_x, mouse_y = 0, 0
-running = True
-fps_display = "FPS: 0"  # Initialize FPS display
+sct = mss.mss()
+monitor = sct.monitors[1]
 
-# Create a lock for thread-safe operations
-lock = threading.Lock()
+bounding_box = {
+    "top": monitor["top"],
+    "left": monitor["left"],
+    "width": monitor["width"],
+    "height": monitor["height"]
+}
 
-def capture_screen():
-    global frame, mouse_x, mouse_y, running, fps_display
+original_cursor_img = cv2.imread('cursor.png', cv2.IMREAD_UNCHANGED)
+cursor_height = 16
+cursor_aspect_ratio = original_cursor_img.shape[1] / original_cursor_img.shape[0]
+cursor_width = int(cursor_height * cursor_aspect_ratio)
+cursor_img = cv2.resize(original_cursor_img, (cursor_width, cursor_height))
 
-    with mss() as sct:
-        monitor = {"top": 0, "left": 0, "width": screen_width, "height": screen_height}
-        fps_start_time = time.time()
-        fps_counter = 0
-        fps_update_interval = 0.5  # Update FPS every 0.5 seconds
+if cursor_img.shape[2] == 4:
+    cursor_alpha = cursor_img[:, :, 3] / 255.0
+    cursor_rgb = cursor_img[:, :, :3]
 
-        while running:
-            img = np.array(sct.grab(monitor))
-            resized_frame = cv2.resize(img, (window_width, window_height))
-            current_mouse_x, current_mouse_y = pyautogui.position()
+fps = 0
+fps_time = time.time()
+frame_count = 0
 
-            with lock:
-                frame = resized_frame
-                mouse_x, mouse_y = current_mouse_x, current_mouse_y
+def main():
+    global frame_count, fps, fps_time
+    
+    app = QApplication([])
+    window = AspectRatioWidget(window_width, window_height, aspect_ratio)
+    window.show()
+    
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    font_thickness = 1
+    font_color = (0, 255, 0)
+    text_position = (10, 20)
 
-            # FPS Calculation
-            fps_counter += 1
-            if (time.time() - fps_start_time) > fps_update_interval:
-                fps = fps_counter / (time.time() - fps_start_time)
-                fps_display = f"FPS: {fps:.2f}"  # Update the global FPS display
-                fps_counter = 0
-                fps_start_time = time.time()
+    def update_frame():
+        global frame_count, fps, fps_time
+        
+        screenshot = np.array(sct.grab(bounding_box))
+        frame = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
+        
+        current_width = window.width()
+        current_height = window.height()
+        
+        frame = cv2.resize(frame, (current_width, current_height), 
+                         interpolation=cv2.INTER_NEAREST)
+        
+        current_mouse_x, current_mouse_y = pyautogui.position()
+        scaled_mouse_x = int(current_mouse_x / scale_factor)
+        scaled_mouse_y = int(current_mouse_y / scale_factor)
+        
+        if cursor_img.shape[2] == 4:
+            if 0 <= scaled_mouse_y < current_height - cursor_height and \
+               0 <= scaled_mouse_x < current_width - cursor_width:
+                roi = frame[scaled_mouse_y:scaled_mouse_y+cursor_height, 
+                          scaled_mouse_x:scaled_mouse_x+cursor_width]
+                if roi.shape[:2] == cursor_rgb.shape[:2]:
+                    for c in range(3):
+                        roi[:, :, c] = roi[:, :, c] * (1 - cursor_alpha) + \
+                                     cursor_rgb[:, :, c] * cursor_alpha
+        
+        current_time = time.time()
+        if current_time - fps_time >= 1:
+            fps = frame_count / (current_time - fps_time)
+            fps_time = current_time
+            frame_count = 0
+        
+        cv2.putText(frame, f'FPS: {int(fps)}', text_position, 
+                    font, font_scale, font_color, font_thickness)
+        
+        height, width, channel = frame.shape
+        bytes_per_line = 3 * width
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
+        window.label.setPixmap(QPixmap.fromImage(q_img))
+        
+        frame_count += 1
 
+    timer = QTimer()
+    timer.timeout.connect(update_frame)
+    timer.start(16)  
+    
+    app.exec_()
 
-def display_screen():
-    global frame, mouse_x, mouse_y, running, fps_display
-    while running:
-        with lock:
-            if frame is not None:
-                display_frame = frame.copy()
-                current_mouse_x, current_mouse_y = mouse_x, mouse_y
-
-        if frame is not None:
-            # Scale cursor position
-            cursor_x = int(current_mouse_x * window_width / screen_width) - cursor_width // 2
-            cursor_y = int(current_mouse_y * window_height / screen_height) - cursor_height // 2
-
-            # Ensure cursor is within frame bounds
-            if 0 <= cursor_x < window_width - cursor_width and 0 <= cursor_y < window_height - cursor_height:
-                if use_gpu:
-                    roi = display_frame[cursor_y:cursor_y + cursor_height, cursor_x:cursor_x + cursor_width, :3]
-                    roi_gpu = cl.array.to_device(queue, roi.astype(np.float32))
-                    out_gpu = cl.array.empty_like(roi_gpu)
-
-                    blend_kernel.alpha_blend(queue, roi.shape[:2], None, roi_gpu.data,
-                                            cursor_alpha_gpu.data, cursor_rgb_gpu.data, out_gpu.data)
-
-                    blended = out_gpu.get()
-                    display_frame[cursor_y:cursor_y + cursor_height, cursor_x:cursor_x + cursor_width, :3] = blended.astype(
-                        np.uint8)
-                else:
-                    # Apply pre-computed alpha blending on CPU
-                    roi = display_frame[cursor_y:cursor_y + cursor_height, cursor_x:cursor_x + cursor_width, :3]
-                    blended = (1 - cursor_alpha) * roi + cursor_alpha * cursor_rgb
-                    display_frame[cursor_y:cursor_y + cursor_height, cursor_x:cursor_x + cursor_width, :3] = blended.astype(
-                        np.uint8)
-
-            # Make the FPS counter smaller and less intrusive
-            cv2.putText(display_frame, fps_display, (10, 15),  # Positioned at the top-left
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)  # Smaller font size and thickness
-
-            cv2.imshow("Screen", display_frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            running = False
-            break
-
-# Start the capture and display threads
-capture_thread = threading.Thread(target=capture_screen)
-display_thread = threading.Thread(target=display_screen)
-
-capture_thread.start()
-display_thread.start()
-
-capture_thread.join()
-display_thread.join()
-
-cv2.destroyAllWindows()
+if __name__ == '__main__':
+    main()
